@@ -240,40 +240,264 @@ def click_download_button_in_first_mt3(page) -> bool:
         print("❌ Lỗi khi click nút trong .mt-3:", e)
         return False
 
-# ==== HÀM: TẢI VIDEO (dựa trên nút trong .mt-3) ====
+# ==== PHÁT HIỆN TRẠNG THÁI GENERATION ====
+def is_generation_running(page) -> bool:
+    """
+    Đang tạo khi:
+      - Có thẻ chứa text 'Cancel generation' còn hiển thị, hoặc
+      - Có progress tạo (class .creating-progress), hoặc
+      - Có message 'Content generation in progress'
+    """
+    try:
+        # 1) Nút Cancel
+        cancel = page.locator("div:has-text('Cancel generation')").first
+        if cancel.count() > 0 and cancel.is_visible():
+            return True
+
+        # 2) Progress tròn
+        if page.locator(".creating-progress").count() > 0:
+            return True
+
+        # 3) Thông báo đang tạo
+        if page.locator("div:has-text('Content generation in progress')").count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def wait_until_ready(page, max_wait_sec: int = 900, poll_sec: float = 3.0) -> None:
+    """
+    Đợi cho tới khi KHÔNG còn trạng thái 'đang tạo'.
+    Hết thời gian thì thoát vòng lặp (vẫn tiếp tục flow tải thử).
+    """
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        if not is_generation_running(page):
+            print("✅ Không còn đang generate — tiếp tục tải.")
+            return
+        remaining = int(deadline - time.time())
+        print(f"⏳ Đang generate... chờ {poll_sec}s (còn ~{remaining}s)")
+        time.sleep(poll_sec)
+    print("⚠️ Hết thời gian chờ, vẫn thấy đang tạo. Sẽ thử tải video sẵn có (nếu có).")
+
+def get_first_ready_video_url(page) -> str | None:
+   
+    return page.evaluate(
+        """
+        () => {
+          // Tìm tất cả thẻ có class chứa 'video-card'
+          const cards = Array.from(document.querySelectorAll('[class*="video-card"]'));
+          for (const card of cards) {
+            // Bỏ qua card đang tạo
+            if (card.querySelector('.creating-progress')) continue;
+            // Tìm video hợp lệ
+            const v = card.querySelector('video');
+            if (v && (v.currentSrc || v.src)) {
+              return v.currentSrc || v.src;
+            }
+          }
+          return null;
+        }
+        """
+    )
+def download_ready_video_like_console(
+    page,
+    save_dir: str,
+    container_selector: str = 'div.flex.flex-col.items-center',
+    first_delay_sec: int = 10,
+    retry_interval_sec: int = 30,
+    per_try_timeout_ms: int = 60_000,
+) -> str:
+    """
+    Lặp cho đến khi KHÔNG còn video đang tạo thì tải video đầu tiên.
+    Trả về đường dẫn file đã tải khi thành công.
+    """
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    attempt = 0
+
+    def has_generating() -> bool:
+        try:
+            if page.locator("div:has-text('Cancel generation')").count() > 0:
+                return True
+            if page.locator(".creating-progress").count() > 0:
+                return True
+            if page.locator("div:has-text('Content generation in progress')").count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # delay đầu tiên
+    print(f"[*] Chờ {first_delay_sec}s trước khi bắt đầu kiểm tra video...")
+    time.sleep(first_delay_sec)
+
+    while True:
+        attempt += 1
+        print(f"\n=== 🔁 Lần thử {attempt} ===")
+
+        if has_generating():
+            print("⏳ Đang có video đang tạo → đợi thêm trước khi retry...")
+            time.sleep(retry_interval_sec)
+            continue
+
+        # Không có video đang tạo → thử lấy URL video đầu tiên
+        video_url = page.evaluate(
+            """
+            () => {
+              const cards = Array.from(document.querySelectorAll('[class*="video-card"]'));
+              for (const card of cards) {
+                // Bỏ qua card đang tạo
+                if (card.querySelector('.creating-progress')) continue;
+                const v = card.querySelector('video');
+                if (v && (v.currentSrc || v.src)) {
+                  return v.currentSrc || v.src;
+                }
+              }
+              return null;
+            }
+            """
+        )
+
+        if not video_url:
+            print("⚠️ Không tìm thấy video sẵn sàng để tải, thử lại sau...")
+            time.sleep(retry_interval_sec)
+            continue
+
+        print(f"🎯 Tìm thấy video URL: {video_url}")
+
+        try:
+            # Thử tải bằng anchor như console
+            with page.expect_download(timeout=per_try_timeout_ms) as dl_info:
+                ok = page.evaluate(
+                    """(url) => {
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'video.mp4';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        return true;
+                    }""",
+                    video_url,
+                )
+                if not ok:
+                    raise RuntimeError("Không thể kích hoạt download bằng anchor.")
+
+            download = dl_info.value  # type: ignore
+            fname = download.suggested_filename or f"video_{int(time.time())}.mp4"
+            target_path = os.path.join(save_dir, fname)
+            download.save_as(target_path)
+            print(f"✅ Đã tải thành công: {target_path}")
+            return target_path
+
+        except Exception as e:
+            print("❌ Lỗi khi tải:", e)
+            time.sleep(retry_interval_sec)
+
+
 def download_video_until_success(page,
                                  save_dir: str,
                                  first_delay_sec: int = 10,
                                  interval_sec: int = 120,
-                                 per_try_timeout_ms: int = 60000):
+                                 per_try_timeout_ms: int = 60_000):
+    """
+    Lặp đến khi tải về thành công:
+      - Đợi first_delay_sec giây trước lần thử đầu.
+      - Mỗi lần thử: đặt expect_download TRƯỚC khi click nút download.
+      - Nếu hết per_try_timeout_ms mà không có file, ngủ interval_sec rồi thử lại.
+    """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     print(f"[*] Đợi {first_delay_sec}s trước khi thử tải...")
     time.sleep(first_delay_sec)
+
     attempt = 0
     while True:
         attempt += 1
         print(f"[*] Thử tải (lần {attempt})...")
 
         try:
-            # Đặt expect_download TRƯỚC khi click
+            # expect_download phải được đặt TRƯỚC khi click
             with page.expect_download(timeout=per_try_timeout_ms) as dl_info:
                 clicked = click_download_button_in_first_mt3(page)
                 if not clicked:
                     raise PlaywrightTimeout("Không click được nút download trong .mt-3")
+
             download = dl_info.value  # type: ignore
             sug = download.suggested_filename
-            target_path = os.path.join(save_dir, sug if sug else f"video_{int(time.time())}.mp4")
+            fname = sug if (sug and sug.strip()) else f"video_{int(time.time())}.mp4"
+            target_path = os.path.join(save_dir, fname)
+
+            # Lưu file
             download.save_as(target_path)
             print(f"✅ Tải thành công: {target_path}")
             return
+
         except PlaywrightTimeout:
             print(f"⏳ Chưa có file tải về trong {per_try_timeout_ms}ms. Thử lại sau {interval_sec}s...")
             time.sleep(interval_sec)
+
         except Exception as e:
             print("❌ Lỗi khi tải:", e)
             time.sleep(interval_sec)
+# ==== CHỜ HẾT QUÁ TRÌNH GENERATION (không còn nút "Cancel generation") ====
+def wait_until_generation_finished(page, max_wait_sec: int = 900, poll_sec: float = 5.0) -> bool:
+    """
+    Trả về True nếu KHÔNG còn nút 'Cancel generation' (đã xong hoặc không xuất hiện),
+    False nếu hết thời gian chờ mà nút vẫn còn hiển thị.
+    """
+    sel = "div:has-text('Cancel generation')"  # bền hơn là match text thay vì full class
+    deadline = time.time() + max_wait_sec
 
-# ==== LUỒNG CHÍNH ====
+    while time.time() < deadline:
+        try:
+            loc = page.locator(sel).first
+            # nếu không tồn tại hoặc không hiển thị => coi như đã xong
+            if loc.count() == 0:
+                print("✅ Không có nút 'Cancel generation' (không xuất hiện).")
+                return True
+            if not loc.is_visible():
+                print("✅ Nút 'Cancel generation' không còn hiển thị.")
+                return True
+
+            # đang hiển thị => vẫn đang generate
+            print("⏳ Đang generate... đợi tiếp", f"({int(deadline - time.time())}s còn lại)")
+            time.sleep(poll_sec)
+
+        except Exception:
+            # Nếu có lỗi tạm thời DOM, coi như đã xong để không kẹt
+            print("ℹ️ Không đọc được trạng thái nút, thử tải tiếp.")
+            return True
+
+    print("⚠️ Hết thời gian chờ, vẫn thấy 'Cancel generation'. Sẽ thử tải dù vậy.")
+    return False
+
+# ==== CLICK NÚT "ant-tour-close" (nếu có) ====
+def click_tour_close_button(page, retries: int = 3, delay_sec: float = 1.5) -> bool:
+    """
+    Tự động click nút hướng dẫn (nút có class 'ant-tour-close') nếu có hiển thị.
+    Thử tối đa `retries` lần, mỗi lần cách nhau `delay_sec` giây.
+    Trả về True nếu click được ít nhất một lần.
+    """
+    for i in range(retries):
+        try:
+            # Dò xem có nút close không
+            btn = page.locator("button.ant-tour-close").first
+            if btn.count() > 0 and btn.is_visible():
+                btn.scroll_into_view_if_needed()
+                btn.click(timeout=3000)
+                print("✅ Đã click nút hướng dẫn (ant-tour-close).")
+                return True
+            else:
+                print(f"⏳ Lần {i+1}: chưa thấy nút ant-tour-close, đợi {delay_sec}s...")
+                time.sleep(delay_sec)
+        except Exception as e:
+            print(f"⚠️ Lỗi khi thử click ant-tour-close (lần {i+1}):", e)
+            time.sleep(delay_sec)
+    print("ℹ️ Không tìm thấy nút ant-tour-close sau khi thử nhiều lần.")
+    return False
+
 def run_flow():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -302,14 +526,69 @@ def run_flow():
             page.wait_for_load_state("load", timeout=60_000)
             time.sleep(3)
 
-            # Nếu bị đá sang login
-            if "accounts.google.com" in page.url or "signin" in page.url:
-                print("⚠️ Cookie không hợp lệ → bị chuyển trang đăng nhập.")
-                try:
-                    page.screenshot(path="redirect_login.png")
-                    Path("redirect_login.html").write_text(page.content(), encoding="utf-8")
-                except: pass
-                return
+            # === ĐÓNG POPUP TOUR (nếu có) ===
+            click_tour_close_button(page)
+
+            # === CLICK NÚT MŨI TÊN MỞ DROPDOWN CHỌN MODEL ===
+            try:
+                page.evaluate("""
+                (() => {
+                  const span = document.querySelector('span.hover\\\\:bg-hl_bg_00_4.cursor-pointer.content-end.rounded-lg.p-2.text-transparent.transition-all.hover\\\\:scale-110');
+                  if (span) {
+                    span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    span.click();
+                    console.log('✅ Đã click mũi tên mở dropdown model.');
+                  } else {
+                    console.warn('⚠️ Không tìm thấy span mũi tên dropdown.');
+                  }
+                })();
+                """)
+                print("✅ Đã click mũi tên mở dropdown model.")
+                time.sleep(2)
+            except Exception as e:
+                print("⚠️ Lỗi khi click mũi tên dropdown:", e)
+
+            # === CLICK CHỌN MODEL “Hailuo 01” ===
+            try:
+                page.evaluate("""
+                (() => {
+                  const divs = document.querySelectorAll('div.hover\\\\:border-hl_bg_00_75.flex.h-\\\\[40px\\\\].cursor-pointer');
+                  for (const div of divs) {
+                    if (div.innerText.includes('Hailuo 01')) {
+                      div.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      div.click();
+                      console.log('✅ Đã click vào thẻ chứa Hailuo 01');
+                      return;
+                    }
+                  }
+                  console.warn('⚠️ Không tìm thấy thẻ chứa "Hailuo 01"');
+                })();
+                """)
+                print("✅ Đã click chọn Hailuo 01.")
+                time.sleep(2)
+            except Exception as e:
+                print("⚠️ Lỗi khi click Hailuo 01:", e)
+
+            # === CLICK CHỌN MODEL CON “Base image-to-video model in 01 series” ===
+            try:
+                page.evaluate("""
+                (() => {
+                  const divs = document.querySelectorAll('div.ant-typography.ant-typography-ellipsis.ant-typography-ellipsis-multiple-line.text-hl_text_02');
+                  for (const div of divs) {
+                    if (div.innerText.trim().includes('Base image-to-video model in 01 series')) {
+                      div.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      div.click();
+                      console.log('✅ Đã click vào thẻ chứa: "Base image-to-video model in 01 series"');
+                      return;
+                    }
+                  }
+                  console.warn('⚠️ Không tìm thấy thẻ cần click');
+                })();
+                """)
+                print("✅ Đã click chọn Base image-to-video model in 01 series.")
+                time.sleep(2)
+            except Exception as e:
+                print("⚠️ Lỗi khi click Base image-to-video model:", e)
 
             # === UPLOAD ẢNH ===
             if not upload_file_via_input(page, IMAGE_PATH):
@@ -332,15 +611,17 @@ def run_flow():
             # === GỬI ===
             click_send_button(page)
 
-            # === DOWNLOAD TỪ .mt-3 ===
+            # === TỰ ĐỘNG TẢI (lặp đến khi tải được video đầu tiên) ===
             if AUTO_TRY_DOWNLOAD:
-                download_video_until_success(
+                saved_path = download_ready_video_like_console(
                     page,
-                    DOWNLOAD_DIR,
-                    first_delay_sec=FIRST_DELAY_BEFORE_DL,
-                    interval_sec=RETRY_INTERVAL_SEC,
+                    save_dir=DOWNLOAD_DIR,
+                    container_selector='div.flex.flex-col.items-center',
+                    first_delay_sec=10,
+                    retry_interval_sec=30,      # đợi 30s giữa mỗi lần kiểm tra
                     per_try_timeout_ms=PER_TRY_TIMEOUT_MS
                 )
+                print("[RESULT] File đã lưu:", saved_path)
 
         except Exception as e:
             print("❌ Lỗi runtime:", e)
@@ -349,12 +630,18 @@ def run_flow():
                 if page:
                     page.screenshot(path="runtime_error.png")
                     Path("runtime_error.html").write_text(page.content(), encoding="utf-8")
-            except: pass
+            except:
+                pass
         finally:
-            try: context.close()
-            except: pass
-            try: browser.close()
-            except: pass
+            try:
+                context.close()
+            except:
+                pass
+            try:
+                browser.close()
+            except:
+                pass
+
 
 if __name__ == "__main__":
     run_flow()

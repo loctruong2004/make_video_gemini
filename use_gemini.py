@@ -7,16 +7,25 @@ import os
 import time, sys, traceback
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-COOKIE_FILE = r"C:\Users\BHMedia-PC\UI_make_video_AI\cookies.json"   # <-- file Netscape cookies (dán nội dung bạn có vào đây)
-TARGET_URL = "https://gemini.google.com/"
-IMAGE_PATH = r"C:\Users\BHMedia-PC\UI_make_video_AI\tx02.webp"  # <-- Ảnh cần upload
-PROMPT_TEXT = "tạo video quảng cáo túi sách"       # <-- Prompt cần nhập
-AUTO_CLICK_SEND = True                                                   # <-- Gửi bằng nút Send message
-AUTO_CLICK_GENERATE = False                                              # <-- Hoặc bấm Generate (đặt True nếu muốn)
+# ====== CẤU HÌNH ======
+COOKIE_FILE   = r"C:\Users\BHMedia-PC\UI_make_video_AI\cookies.json"   # Netscape cookies
+TARGET_URL    = "https://gemini.google.com/app"
+IMAGE_PATH    = r"C:\Users\BHMedia-PC\UI_make_video_AI\tx02.webp"      # file ảnh cần upload
+PROMPT_TEXT   = "tạo video quảng cáo túi sách"                          # prompt cần nhập
+
+AUTO_CLICK_SEND     = True     # Gửi bằng "Send message"
+AUTO_CLICK_GENERATE = False    # Hoặc bấm "Generate" (đặt True nếu muốn)
 
 # Thư mục lưu video tải về
-DOWNLOAD_DIR = r"C:\Users\BHMedia-PC\UI_make_video_AI\downloads"
+DOWNLOAD_DIR  = r"C:\Users\BHMedia-PC\UI_make_video_AI\downloads"
 
+# Thời gian đợi & retry
+FIRST_DOWNLOAD_DELAY_SEC = 10      # đợi trước lần thử tải đầu tiên
+RETRY_INTERVAL_SEC       = 120     # khoảng cách giữa các lần thử tải
+PER_TRY_TIMEOUT_MS       = 60_000  # timeout chờ event download mỗi lần thử
+
+
+# ====== HÀM TIỆN ÍCH COOKIE ======
 def parse_cookies_netscape(path: str):
     out = []
     txt = Path(path).read_text(encoding="utf-8", errors="ignore")
@@ -30,7 +39,7 @@ def parse_cookies_netscape(path: str):
         if len(parts) < 7:
             continue
         domain, include_sub, path_v, secure_flag, expires, name, value = parts[:7]
-        secure = secure_flag.upper() == "TRUE"
+        secure = str(secure_flag).upper() == "TRUE"
         try:
             expires_i = int(expires)
         except Exception:
@@ -64,22 +73,22 @@ def load_cookies_into_context(context, cookie_file: str):
     except Exception as e:
         print("[!] Lỗi khi add_cookies:", e)
         return False
-def _wait_image_ready(page, max_wait_sec: int = 30) -> bool:
-    """
-    Đợi cho đến khi input[type=file] có ít nhất 1 file (ảnh đã gắn vào form).
-    Trả về True nếu đã thấy file, False nếu quá timeout.
-    """
+
+
+# ====== HÀM TRỢ GIÚP UI ======
+def wait_image_attached(page, max_wait_sec: int = 30) -> bool:
+    """Đợi input[type=file] có file (xác nhận ảnh đã attach)."""
     start = time.time()
     while time.time() - start < max_wait_sec:
         try:
-            has_file = page.evaluate("""
-            () => {
-              const inp = document.querySelector('input[type="file"]');
-              if (!inp) return false;
-              const f = inp.files;
-              return !!(f && f.length > 0);
-            }
-            """)
+            has_file = page.evaluate(
+                """() => {
+                    const inp = document.querySelector('input[type="file"]');
+                    if (!inp) return false;
+                    const f = inp.files;
+                    return !!(f && f.length > 0);
+                }"""
+            )
             if has_file:
                 print("✅ Ảnh đã được gắn vào input.")
                 return True
@@ -89,48 +98,52 @@ def _wait_image_ready(page, max_wait_sec: int = 30) -> bool:
     print(f"⚠️ Hết {max_wait_sec}s vẫn chưa xác nhận ảnh gắn vào input.")
     return False
 
-def _try_click_tools(page) -> bool:
+
+def try_click_tools(page) -> bool:
+    """Mở panel Tools."""
     try:
-        page.get_by_role("button", name="Tools").click(timeout=15000)
-        print("✅ Đã click Tools (role).")
+        page.get_by_role("button", name="Tools").click(timeout=15_000)
+        print("✅ Click Tools (role).")
         return True
     except Exception:
         pass
     try:
-        page.click("button.toolbox-drawer-button:has-text('Tools')", timeout=15000)
-        print("✅ Đã click Tools (CSS).")
+        page.click("button.toolbox-drawer-button:has-text('Tools')", timeout=15_000)
+        print("✅ Click Tools (CSS).")
         return True
     except Exception:
         pass
     try:
-        icon = page.query_selector("mat-icon[fonticon='page_info']")
-        if icon:
+        icon = page.locator("mat-icon[fonticon='page_info']").first
+        if icon.count() > 0:
             btn = icon.evaluate_handle("el => el.closest('button')")
             if btn:
                 page.evaluate("(el)=>el.scrollIntoView({block:'center'})", btn)
                 page.evaluate("(el)=>el.click()", btn)
-                print("✅ Đã click Tools (icon).")
+                print("✅ Click Tools (icon).")
                 return True
     except Exception as e:
         print("[!] Lỗi click Tools:", e)
     return False
 
-def _try_click_create_veo(page) -> bool:
+
+def try_click_create_veo(page) -> bool:
+    """Click 'Create videos with Veo'."""
     try:
-        page.get_by_role("button", name="Create videos with Veo").click(timeout=15000)
+        page.get_by_role("button", name="Create videos with Veo").click(timeout=15_000)
         print("✅ Click 'Create videos with Veo' (role).")
         return True
     except Exception:
         pass
     try:
-        page.click("button:has-text('Create videos with Veo')", timeout=15000)
+        page.click("button:has-text('Create videos with Veo')", timeout=15_000)
         print("✅ Click 'Create videos with Veo' (CSS).")
         return True
     except Exception:
         pass
     try:
-        icon = page.query_selector("mat-icon[fonticon='movie']")
-        if icon:
+        icon = page.locator("mat-icon[fonticon='movie']").first
+        if icon.count():
             btn = icon.evaluate_handle("el => el.closest('button')")
             if btn:
                 page.evaluate("(el)=>el.scrollIntoView({block:'center'})", btn)
@@ -141,29 +154,37 @@ def _try_click_create_veo(page) -> bool:
         print("❌ Không click được 'Create videos with Veo':", e)
     return False
 
-def _click_add_photo_via_js(page) -> bool:
-    try:
-        page.evaluate("""
-        document.querySelector("mat-icon[fonticon='add_photo_alternate']")
-          ?.closest("button")
-          ?.click();
-        """)
-        print("✅ Đã click 'Add photo' (JS).")
-        return True
-    except Exception as e:
-        print("❌ Không click được 'Add photo' qua JS:", e)
-        return False
 
-def _upload_image_via_input(page, image_path: str) -> bool:
+def click_add_photo(page) -> bool:
+    """Click 'Add photo' bằng JS (ổn hơn trên giao diện Angular/Material)."""
+    try:
+        ok = page.evaluate("""
+        (() => {
+          const btn = document.querySelector("mat-icon[fonticon='add_photo_alternate']")?.closest("button");
+          if (!btn) return false;
+          btn.click();
+          return true;
+        })();
+        """)
+        if ok:
+            print("✅ Đã click 'Add photo'.")
+            return True
+    except Exception as e:
+        print("❌ Không click được 'Add photo':", e)
+    return False
+
+
+def upload_image_via_input(page, image_path: str) -> bool:
+    """Gán file ảnh vào input[type=file]."""
     try:
         time.sleep(1)
-        loc = page.locator("input[type='file'][accept*='image']")
+        loc = page.locator("input[type='file'][accept*='image']").first
         if not loc.count():
-            loc = page.locator("input[type='file']")
-        loc.first.wait_for(state="attached", timeout=10000)
+            loc = page.locator("input[type='file']").first
+        loc.wait_for(state="attached", timeout=10_000)
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
-        loc.first.set_input_files(image_path)
+        loc.set_input_files(image_path)
         print(f"✅ Đã upload ảnh: {image_path}")
         return True
     except Exception as e:
@@ -175,48 +196,56 @@ def _upload_image_via_input(page, image_path: str) -> bool:
             pass
         return False
 
-def _fill_prompt_quill(page, text: str) -> bool:
+
+def fill_prompt_quill(page, text: str) -> bool:
+    """Nhập prompt vào editor Quill."""
     try:
-        ok = page.evaluate("""
-        (text) => {
-          const el = document.querySelector('.ql-editor.textarea.new-input-ui[contenteditable="true"]');
-          if (!el) return false;
-          el.focus();
-          document.execCommand('selectAll', false, null);
-          document.execCommand('delete', false, null);
-          document.execCommand('insertText', false, text);
-          el.dispatchEvent(new InputEvent('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-          return true;
-        }
-        """, text)
+        ok = page.evaluate(
+            """
+            (text) => {
+              const el = document.querySelector('.ql-editor.textarea.new-input-ui[contenteditable="true"]');
+              if (!el) return false;
+              el.focus();
+              document.execCommand('selectAll', false, null);
+              document.execCommand('delete', false, null);
+              document.execCommand('insertText', false, text);
+              el.dispatchEvent(new InputEvent('input', {bubbles: true}));
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+              return true;
+            }
+            """,
+            text,
+        )
         if ok:
             print("✅ Đã nhập prompt vào ô mô tả video.")
             return True
-        else:
-            print("⚠️ Không tìm thấy ô nhập (Quill editor).")
-            return False
+        print("⚠️ Không tìm thấy ô nhập (Quill editor).")
+        return False
     except Exception as e:
         print("❌ Lỗi khi nhập prompt:", e)
         return False
 
-def _click_generate(page) -> bool:
+
+def click_generate(page) -> bool:
+    """Bấm nút Generate."""
     try:
-        page.get_by_role("button", name="Generate").click(timeout=10000)
+        page.get_by_role("button", name="Generate").click(timeout=10_000)
         print("✅ Đã bấm nút Generate.")
         return True
     except Exception:
         try:
-            page.locator("button:has-text('Generate')").first.click(timeout=10000)
+            page.locator("button:has-text('Generate')").first.click(timeout=10_000)
             print("✅ Đã bấm nút Generate (fallback).")
             return True
         except Exception as e:
             print("⚠️ Không bấm được Generate:", e)
             return False
 
-def _click_send_message(page) -> bool:
+
+def click_send_message(page) -> bool:
+    """Bấm nút Send message."""
     try:
-        page.evaluate("""
+        ok = page.evaluate("""
         (() => {
           const btn = document.querySelector('button[aria-label="Send message"]');
           if (!btn) return false;
@@ -224,44 +253,43 @@ def _click_send_message(page) -> bool:
           return true;
         })();
         """)
-        print("✅ Đã bấm nút Send message.")
-        return True
-    except Exception as e:
-        print("⚠️ Không bấm được Send message:", e)
-        try:
-            page.locator('mat-icon[fonticon="send"]').first.evaluate("el => el.closest('button').click()")
-            print("✅ Đã bấm nút Send message (fallback icon).")
-            return True
-        except Exception as e2:
-            print("❌ Send message thất bại:", e2)
-            return False
-
-def _click_download_button_js(page) -> bool:
-    """Click nút Download video bằng JS theo yêu cầu."""
-    try:
-        ok = page.evaluate("""
-        (() => {
-          const btn = document.querySelector('button[aria-label="Download video"]')
-                   || document.querySelector('mat-icon[fonticon="download"]')?.closest('button');
-          if (!btn) return false;
-          btn.click();
-          return true;
-        })();
-        """)
         if ok:
-            print("✅ Đã bấm nút Download video.")
+            print("✅ Đã bấm nút Send message.")
             return True
-        print("⚠️ Chưa thấy nút Download video.")
-        return False
-    except Exception as e:
-        print("⚠️ Lỗi khi click Download video:", e)
+    except Exception:
+        pass
+    # fallback icon
+    try:
+        page.locator('mat-icon[fonticon="send"]').first.evaluate("el => el.closest('button').click()")
+        print("✅ Đã bấm nút Send message (fallback icon).")
+        return True
+    except Exception as e2:
+        print("❌ Send message thất bại:", e2)
         return False
 
-def _download_video_until_success(page, save_dir: str, first_delay_sec: int = 10, interval_sec: int = 120, per_try_timeout_ms: int = 60000) -> None:
+
+# ====== DOWNLOAD: tìm nút, hover rồi click trong expect_download ======
+def get_download_btn(page):
+    """Trả về locator của nút Download (ưu tiên aria-label, fallback theo icon)."""
+    sel = (
+        'button[aria-label="Download video"].download-button, '
+        'button.download-button:has(.mat-icon[data-mat-icon-name="download"]), '
+        'button.download-button:has(.mat-icon[fonticon="download"])'
+    )
+    return page.locator(sel).first
+
+
+def download_video_until_success(page,
+                                 save_dir: str,
+                                 first_delay_sec: int = FIRST_DOWNLOAD_DELAY_SEC,
+                                 interval_sec: int = RETRY_INTERVAL_SEC,
+                                 per_try_timeout_ms: int = PER_TRY_TIMEOUT_MS) -> str:
     """
-    Đợi first_delay_sec (mặc định 10s) sau khi gửi, rồi
-    LẶP VÔ HẠN: mỗi interval_sec (mặc định 120s) bấm Download và chờ sự kiện download.
-    Khi tải thành công thì kết thúc (return).
+    Lặp đến khi tải về thành công:
+      - Đợi first_delay_sec trước lần thử đầu.
+      - Mỗi lần thử: tìm nút download → scroll + hover → expect_download TRƯỚC → click.
+      - Nếu hết per_try_timeout_ms mà không có file, ngủ interval_sec rồi thử lại.
+    Trả về đường dẫn file đã lưu.
     """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     print(f"[*] Đợi {first_delay_sec}s rồi bắt đầu thử tải...")
@@ -271,32 +299,57 @@ def _download_video_until_success(page, save_dir: str, first_delay_sec: int = 10
     while True:
         attempt += 1
         print(f"[*] Thử tải video (lần {attempt})... (Ctrl+C để dừng)")
-        clicked = _click_download_button_js(page)
-        if not clicked:
-            print(f"⏳ Chưa thấy nút Download. Sẽ thử lại sau {interval_sec} giây...")
+
+        btn = get_download_btn(page)
+        try:
+            btn.wait_for(state="visible", timeout=10_000)
+        except Exception:
+            print(f"⏳ Chưa thấy nút Download. Thử lại sau {interval_sec}s...")
             time.sleep(interval_sec)
             continue
+
+        # Hover trước để unlock
         try:
+            btn.scroll_into_view_if_needed(timeout=5_000)
+            btn.hover(timeout=5_000)
+        except Exception:
+            pass  # đôi khi không cần hover
+
+        try:
+            # expect_download PHẢI TRƯỚC khi click
             with page.expect_download(timeout=per_try_timeout_ms) as dl_info:
-                pass
+                btn.click(timeout=10_000)
             download = dl_info.value  # type: ignore
-            sug = download.suggested_filename
-            target_path = os.path.join(save_dir, sug if sug else f"video_{int(time.time())}.mp4")
+
+            # Gợi ý tên file & nơi lưu
+            sug = (download.suggested_filename or "").strip()
+            fname = sug if sug else f"video_{int(time.time())}.mp4"
+            target_path = os.path.join(save_dir, fname)
+
+            # (tuỳ chọn) in ra đường dẫn tạm
+            try:
+                tmp_path = download.path()
+                if tmp_path:
+                    print(f"    • File tạm: {tmp_path}")
+            except Exception:
+                pass
+
+            # Lưu file về thư mục bạn chọn
             download.save_as(target_path)
             print(f"✅ Tải xong: {target_path}")
-            return
+            return target_path
+
         except PlaywrightTimeout:
-            print(f"⏳ Chưa có download (timeout {per_try_timeout_ms} ms). Sẽ thử lại sau {interval_sec} giây...")
+            print(f"⏳ Hết {per_try_timeout_ms}ms chưa có sự kiện download. Thử lại sau {interval_sec}s...")
             time.sleep(interval_sec)
+
         except Exception as e:
             print("❌ Lỗi trong quá trình tải:", e)
             time.sleep(interval_sec)
 
-def click_tools_flow():
-    from playwright.sync_api import sync_playwright
-    from pathlib import Path
-    import time, traceback
 
+# ====== LUỒNG CHÍNH ======
+def click_tools_flow():
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=False,
@@ -306,7 +359,6 @@ def click_tools_flow():
             ],
         )
 
-        # Cho phép tải file
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -317,14 +369,14 @@ def click_tools_flow():
         )
 
         try:
-            ok = load_cookies_into_context(context, COOKIE_FILE)
+            _ = load_cookies_into_context(context, COOKIE_FILE)
             page = context.new_page()
 
-            target = "https://gemini.google.com/app"
-            print("[*] Mở trang:", target)
-            page.goto(target, wait_until="domcontentloaded", timeout=120_000)
-
+            print("[*] Mở trang:", TARGET_URL)
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=120_000)
+            page.wait_for_load_state("load", timeout=60_000)
             time.sleep(5)
+
             if "accounts.google.com" in page.url or "signin" in page.url:
                 print("⚠️ Cookie/phiên không hợp lệ → bị chuyển sang trang đăng nhập.")
                 try:
@@ -332,61 +384,58 @@ def click_tools_flow():
                     Path("redirect_page.html").write_text(page.content(), encoding="utf-8")
                 except:
                     pass
-                context.close(); browser.close(); return
+                return
 
-            page.wait_for_load_state("load", timeout=60_000)
-
-            # 1) Tools
-            if not _try_click_tools(page):
-                print("⚠️ Không click được Tools. Lưu debug.")
+            # 1) Mở Tools
+            if not try_click_tools(page):
+                print("⚠️ Không click được Tools.")
                 try:
                     page.screenshot(path="no_click_tools.png")
                     Path("page_no_click_tools.html").write_text(page.content(), encoding="utf-8")
                 except: pass
-                context.close(); browser.close(); return
+                return
 
-            # 2) Veo
+            # 2) Chọn Veo
             time.sleep(1)
-            if not _try_click_create_veo(page):
-                print("⚠️ Không click được 'Create videos with Veo'. Lưu debug.")
+            if not try_click_create_veo(page):
+                print("⚠️ Không click được 'Create videos with Veo'.")
                 try:
                     page.screenshot(path="no_click_veo.png")
                     Path("page_no_click_veo.html").write_text(page.content(), encoding="utf-8")
                 except: pass
 
             time.sleep(2)
-            print("Title:", page.title())
             try:
                 Path("after_click_veo.html").write_text(page.content(), encoding="utf-8")
             except: pass
 
             # 3) Add photo + upload
-            if _click_add_photo_via_js(page):
-                if _upload_image_via_input(page, IMAGE_PATH):
-                    # ⬇️ ĐỢI ẢNH THỰC SỰ GẮN VÀO FORM
-                    _wait_image_ready(page, max_wait_sec=30)
-                    # ⬇️ RỒI ĐỢI THÊM 10 GIÂY NHƯ YÊU CẦU
-                    time.sleep(10)
+            # if click_add_photo(page):
+            if upload_image_via_input(page, IMAGE_PATH):
+                # Đợi ảnh attach thật sự
+                wait_image_attached(page, max_wait_sec=30)
+                # Đợi thêm cho UI xử lý
+                time.sleep(10)
 
             # 4) Nhập prompt
-            _fill_prompt_quill(page, PROMPT_TEXT)
+            fill_prompt_quill(page, PROMPT_TEXT)
             time.sleep(10)
 
             # 5) Gửi: ưu tiên Send, nếu không thì Generate
             if AUTO_CLICK_SEND:
-                _click_send_message(page)
+                click_send_message(page)
             elif AUTO_CLICK_GENERATE:
-                _click_generate(page)
+                click_generate(page)
 
-
-            # 6) Đợi 10s, rồi lặp 2 phút/lần cho tới khi download thành công
-            _download_video_until_success(
+            # 6) Đợi & tải
+            path_saved = download_video_until_success(
                 page,
                 DOWNLOAD_DIR,
-                first_delay_sec=10,
-                interval_sec=120,
-                per_try_timeout_ms=60000
+                first_delay_sec=FIRST_DOWNLOAD_DELAY_SEC,
+                interval_sec=RETRY_INTERVAL_SEC,
+                per_try_timeout_ms=PER_TRY_TIMEOUT_MS
             )
+            print(">>> File đã lưu:", path_saved)
 
             time.sleep(2)
 
@@ -402,6 +451,7 @@ def click_tools_flow():
             except: pass
             try: browser.close()
             except: pass
+
 
 if __name__ == "__main__":
     click_tools_flow()
